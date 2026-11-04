@@ -1,102 +1,48 @@
-import User from "../models/User.js";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+import User from "../models/User.js";
+import { signToken } from "../utils/jwt.js";
+
+const publicUser = (u) => ({ id: u._id, name: u.name, email: u.email });
+const normEmail = (e) => String(e ?? "").trim().toLowerCase();
 
 export async function register(req, res) {
-    try {
-        const { name, email, password } = req.body;
+  const name = String(req.body?.name ?? "").trim();
+  const email = normEmail(req.body?.email);
+  const password = String(req.body?.password ?? "");
 
-        if (!name || !email || !password)
-            return res.status(400).json({
-                message: 'Todos los campos son requeridos'
-            });
+  if (!name || !email || !password)
+    return res.status(400).json({ message: "Todos los campos son requeridos" });
+  if (password.length < 6)
+    return res.status(400).json({ message: "La contraseña debe tener al menos 6 caracteres" });
 
-        const exists = await User.findOne({ email });
+  // Normalizar el email antes de buscar: antes "Ana@x.com" y "ana@x.com"
+  // pasaban la validación y terminaban en un error 500 por el índice único.
+  if (await User.exists({ email }))
+    return res.status(409).json({ message: "Ya existe una cuenta con ese email" });
 
-        if (exists)
-            return res.status(409).json({
-                message: 'El usuario ya existe'
-            });
-
-        const hash = await bcrypt.hash(password, 10);
-
-        const user = new User({
-            name,
-            email,
-            password: hash
-        });
-
-        await user.save();
-
-        const token = jwt.sign(
-            { id: user._id },
-            process.env.JWT_SECRET || 'changeme',
-            { expiresIn: '7d' }
-        );
-
-        res.status(201).json({
-            token,
-            user: {
-                id: user._id,
-                name: user.name,
-                email: user.email
-            }
-        });
-
-    } catch (e) {
-        res.status(500).json({
-            message: 'Error del servidor'
-        });
-        
-    }
+  try {
+    const user = await User.create({ name, email, password: await bcrypt.hash(password, 10) });
+    res.status(201).json({ token: signToken(user._id), user: publicUser(user) });
+  } catch (e) {
+    if (e?.code === 11000) // dos registros simultáneos con el mismo email
+      return res.status(409).json({ message: "Ya existe una cuenta con ese email" });
+    throw e;
+  }
 }
 
 export async function login(req, res) {
-    try {
-        const { email, password } = req.body;
+  const email = normEmail(req.body?.email);
+  const password = String(req.body?.password ?? "");
 
-        const user = await User.findOne({ email });
+  const user = await User.findOne({ email });
+  const ok = user && (await bcrypt.compare(password, user.password));
+  if (!ok) return res.status(401).json({ message: "Email o contraseña incorrectos" });
 
-        if (!user) {
-            return res.status(401).json({
-                message: 'El correo o la contraseña son incorrectos'
-            });
-        }
-
-        const ok = await bcrypt.compare(password, user.password);
-
-        if (!ok) {
-            return res.status(401).json({
-                message: 'El correo o la contraseña son incorrectos'
-            });
-        }
-
-        const token = jwt.sign(
-            { id: user._id },
-            process.env.JWT_SECRET || 'changeme',
-            { expiresIn: '7d' }
-        );
-
-        res.json({
-            token,
-            user: {
-                id: user._id,
-                name: user.name,
-                email: user.email
-            }
-        });
-
-    } catch (e) {
-        res.status(500).json({
-            message: 'Error del servidor'
-        });
-    }
+  res.json({ token: signToken(user._id), user: publicUser(user) });
 }
 
 export async function profile(req, res) {
-    const user = await User
-        .findById(req.userId)
-        .select("_id name email");
-
-    res.json({ user });
+  const user = await User.findById(req.userId).select("_id name email");
+  if (!user) return res.status(404).json({ message: "Usuario no encontrado" });
+  res.json({ user: publicUser(user) });
 }

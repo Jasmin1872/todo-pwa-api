@@ -1,92 +1,134 @@
-import Task from "../models/Task.js";
-const allowed = ["Pendiente", "En Progreso", "Completada"];
+// En Express 5 los errores de funciones async llegan solos al manejador de errores,
+// por eso no hace falta try/catch en cada función.
+import mongoose from "mongoose";
+import Task, { STATUS, PRIORITY } from "../models/Task.js";
+import { httpError } from "../utils/httpError.js";
+
+/** Toma del body SOLO los campos editables y los valida. Ignora el resto. */
+function pickPatch(body = {}) {
+  const patch = {};
+
+  if (body.title !== undefined) {
+    const title = String(body.title).trim();
+    if (!title) throw httpError(400, "El título no puede estar vacío");
+    patch.title = title;
+  }
+  if (body.description !== undefined) patch.description = String(body.description ?? "").trim();
+
+  if (body.status !== undefined) {
+    if (!STATUS.includes(body.status)) throw httpError(400, "Estado inválido");
+    patch.status = body.status;
+  }
+  if (body.priority !== undefined) {
+    if (!PRIORITY.includes(body.priority)) throw httpError(400, "Prioridad inválida");
+    patch.priority = body.priority;
+  }
+  if (body.dueDate !== undefined) {
+    if (body.dueDate === null || body.dueDate === "") patch.dueDate = null;
+    else {
+      const d = new Date(body.dueDate);
+      if (Number.isNaN(d.getTime())) throw httpError(400, "Fecha de vencimiento inválida");
+      patch.dueDate = d;
+    }
+  }
+  return patch;
+}
+
+function assertObjectId(id) {
+  // Un id local (UUID) provocaba un CastError → 500. Ahora es un 400 claro.
+  if (!mongoose.isValidObjectId(id)) throw httpError(400, "Id de tarea inválido");
+}
+
+const sameDate = (a, b) => (a ? a.getTime() : null) === (b ? b.getTime() : null);
 
 export async function list(req, res) {
-  const items = await Task.find({ user: req.userId, deleted: false }).sort({ createdAt: -1 });
-  // puedes dejar {items} si ya tienes el front normalizando
+  const items = await Task.find({ user: req.userId, deleted: false })
+    .sort({ createdAt: -1 })
+    .select("-remindedAt -__v");
   res.json({ items });
 }
 
 export async function create(req, res) {
-  const { title, description = "", status = "Pendiente", clienteId } = req.body;
-  if (!title) return res.status(400).json({ message: "El título es requerido" });
+  const patch = pickPatch(req.body);
+  if (!patch.title) throw httpError(400, "El título es requerido");
 
-  const task = await Task.create({
-    user: req.userId,
-    title,
-    description,
-    status: allowed.includes(status) ? status : "Pendiente",
-    clienteId,
-  });
+  const clienteId = typeof req.body.clienteId === "string" ? req.body.clienteId.trim() : "";
+
+  // Idempotente: si el mismo clienteId llega dos veces (reintento), no se duplica.
+  const task = clienteId
+    ? await Task.findOneAndUpdate(
+        { user: req.userId, clienteId },
+        { $setOnInsert: { ...patch, user: req.userId, clienteId } },
+        { upsert: true, new: true, runValidators: true }
+      )
+    : await Task.create({ ...patch, user: req.userId });
 
   res.status(201).json({ task });
 }
 
 export async function update(req, res) {
-  const { id } = req.params;
-  let { title, description, status, completed } = req.body;
+  assertObjectId(req.params.id);
+  const patch = pickPatch(req.body);
 
-  // Soporta front que manda completed:boolean
-  if (typeof completed === "boolean") {
-    status = completed ? "Completada" : "Pendiente";
-  }
+  const task = await Task.findOne({ _id: req.params.id, user: req.userId, deleted: false });
+  if (!task) throw httpError(404, "Tarea no encontrada");
 
-  if (status && !allowed.includes(status)) {
-    return res.status(400).json({ message: "Estado inválido" });
-  }
+  // Si cambió la fecha de vencimiento, el recordatorio debe volver a enviarse.
+  if ("dueDate" in patch && !sameDate(task.dueDate, patch.dueDate)) task.remindedAt = null;
 
-  const set = {};
-  if (typeof title === "string") set.title = title.trim();
-  if (typeof description === "string") set.description = description.trim();
-  if (status) set.status = status;
-
-  const task = await Task.findOneAndUpdate(
-    { _id: id, user: req.userId },
-    { $set: set },
-    { new: true }
-  );
-
-  if (!task) return res.status(404).json({ message: "Tarea no encontrada" });
+  task.set(patch);
+  await task.save(); // save() sí ejecuta validaciones (enum, required, maxlength)
   res.json({ task });
 }
 
 export async function remove(req, res) {
-  const { id } = req.params;
+  assertObjectId(req.params.id);
   const task = await Task.findOneAndUpdate(
-    { _id: id, user: req.userId },
+    { _id: req.params.id, user: req.userId, deleted: false },
     { deleted: true },
     { new: true }
   );
-  if (!task) return res.status(404).json({ message: "Tarea no encontrada" });
+  if (!task) throw httpError(404, "Tarea no encontrada");
   res.json({ ok: true });
 }
 
-/** Sincronización offline */
+/**
+ * SINCRONIZACIÓN OFFLINE: crea o actualiza por clienteId y devuelve el mapeo
+ * clienteId → serverId. Es idempotente: mandarlo dos veces no duplica nada.
+ */
 export async function bulksync(req, res) {
-  const { tasks = [] } = req.body;
-  const mapping = [];
+  const { tasks = [] } = req.body ?? {};
+  if (!Array.isArray(tasks)) throw httpError(400, "tasks debe ser un arreglo");
+  if (tasks.length > 200) throw httpError(400, "Máximo 200 tareas por sincronización");
 
-  for (const t of tasks) {
-    if (!t?.clienteId || !t?.title) continue;
+  const ops = [];
+  const clienteIds = [];
+  let skipped = 0;
 
-    let doc = await Task.findOne({ user: req.userId, clienteId: t.clienteId });
-    if (!doc) {
-      doc = await Task.create({
-        user: req.userId,
-        title: t.title,
-        description: t.description ?? "",
-        status: allowed.includes(t.status) ? t.status : "Pendiente",
-        clienteId: t.clienteId,
+  for (const raw of tasks) {
+    try {
+      const clienteId = typeof raw?.clienteId === "string" ? raw.clienteId.trim() : "";
+      const patch = pickPatch(raw);
+      if (!clienteId || !patch.title) { skipped++; continue; }
+
+      // Solo $set de los campos que llegaron; los demás conservan su valor
+      // (antes se sobrescribían description y status con valores por defecto).
+      ops.push({
+        updateOne: {
+          filter: { user: req.userId, clienteId },
+          update: { $set: patch, $setOnInsert: { user: req.userId, clienteId, deleted: false } },
+          upsert: true,
+        },
       });
-    } else {
-      doc.title = t.title ?? doc.title;
-      doc.description = t.description ?? doc.description;
-      if (t.status && allowed.includes(t.status)) doc.status = t.status;
-      await doc.save();
+      clienteIds.push(clienteId);
+    } catch {
+      skipped++; // una tarea inválida no tumba toda la sincronización
     }
-
-    mapping.push({ clienteId: t.clienteId, serverId: String(doc._id) });
   }
 
-  res.json({ mapping });
+  if (ops.length) await Task.bulkWrite(ops, { ordered: false });
+
+  const docs = await Task.find({ user: req.userId, clienteId: { $in: clienteIds } }).select("_id clienteId");
+  const mapping = docs.map((d) => ({ clienteId: d.clienteId, serverId: String(d._id) }));
+  res.json({ mapping, skipped });
 }
